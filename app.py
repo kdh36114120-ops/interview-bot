@@ -21,8 +21,11 @@ def get_secret(name, default=None):
 
 PASSWORD = get_secret("APP_PASSWORD", "pnumis")             # 과제 비밀번호
 API_KEY = get_secret("GEMINI_API_KEY")                       # Gemini API 키 (코드에 직접 쓰지 않기!)
-MODEL = get_secret("MODEL", "gemini-flash-latest")           # 기본 AI 모델
-BACKUP_MODEL = get_secret("BACKUP_MODEL", "gemini-flash-lite-latest")  # 기본 모델이 안 될 때 쓰는 예비 모델
+MODEL = get_secret("MODEL", "gemini-flash-latest")           # 먼저 써볼 AI 모델
+
+# 먼저 써본 모델이 안 되면 차례대로 시도할 모델들
+PREFERRED_MODELS = [MODEL, "gemini-flash-latest", "gemini-3.7-flash", "gemini-3.6-flash",
+                    "gemini-flash-lite-latest", "gemini-3.5-flash-lite"]
 
 # 기관 정보: 각 기관 홈페이지의 '인재상', '주요 사업'을 복사해서 더 채우면 질문이 더 정확해져요.
 INSTITUTIONS = {
@@ -89,7 +92,37 @@ if not API_KEY:
     st.error("Gemini API 키가 설정되지 않았어요. Streamlit Cloud의 Secrets에 GEMINI_API_KEY를 넣어주세요.")
     st.stop()
 
-client = genai.Client(api_key=API_KEY)
+# v1beta 주소를 써야 최신 모델과 '-latest' 이름을 쓸 수 있어요.
+client = genai.Client(api_key=API_KEY, http_options=types.HttpOptions(api_version="v1beta"))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def find_models():
+    """내 API 키로 쓸 수 있는 모델 이름들을 구글에 물어봐요. (1시간 동안 기억)"""
+    try:
+        names = []
+        for m in client.models.list():
+            if "generateContent" in (m.supported_actions or []):
+                names.append(m.name.replace("models/", ""))
+        return names
+    except Exception:
+        return []  # 목록을 못 받아오면 미리 정해둔 모델들로 시도해요.
+
+
+def model_candidates():
+    """시도할 모델 순서를 정해요. 한 번 성공한 모델이 있으면 그걸 제일 먼저 써요."""
+    available = find_models()
+    if available:
+        candidates = [m for m in PREFERRED_MODELS if m in available]
+        skip = ["tts", "image", "live", "audio", "embedding", "robotics"]
+        candidates += [n for n in available
+                       if "flash" in n and not any(word in n for word in skip)]
+    else:
+        candidates = list(PREFERRED_MODELS)
+    good = st.session_state.get("good_model")
+    if good:
+        candidates.insert(0, good)
+    return list(dict.fromkeys(candidates))  # 중복 없애기 (순서는 유지)
 
 
 # =====================================================
@@ -118,19 +151,20 @@ if "history" not in st.session_state:
 # 3. AI에게 물어보는 함수들
 # =====================================================
 def ask_ai(contents, system_prompt, json_mode=False):
-    """Gemini에게 대화를 보내고 답변 글자를 받아와요. 기본 모델이 안 되면 예비 모델로 다시 시도해요."""
+    """Gemini에게 대화를 보내고 답변 글자를 받아와요. 모델이 안 되면 다음 모델로 다시 시도해요."""
     config = types.GenerateContentConfig(
         system_instruction=system_prompt,
         response_mime_type="application/json" if json_mode else "text/plain",
     )
-    last_error = None
-    for model in [MODEL, BACKUP_MODEL]:
+    errors = []
+    for model in model_candidates()[:5]:  # 최대 5개까지만 시도
         try:
             response = client.models.generate_content(model=model, contents=contents, config=config)
+            st.session_state.good_model = model  # 성공한 모델은 기억해 둬요.
             return response.text
         except Exception as e:
-            last_error = e
-    raise last_error
+            errors.append(f"- {model}: {str(e)[:200]}")
+    raise RuntimeError("\n".join(errors))
 
 
 def safe_ask(contents, system_prompt, json_mode=False):
@@ -138,8 +172,9 @@ def safe_ask(contents, system_prompt, json_mode=False):
     try:
         return ask_ai(contents, system_prompt, json_mode)
     except Exception as e:
-        st.error("AI 응답 중 오류가 났어요. 잠시 후 다시 시도해 주세요.\n\n"
-                 f"(오류 내용: {e})")
+        st.error("AI 응답 중 오류가 났어요. 잠시 후 다시 시도해 주세요.")
+        with st.expander("오류 자세히 보기"):
+            st.code(str(e), language=None)
         return None
 
 
